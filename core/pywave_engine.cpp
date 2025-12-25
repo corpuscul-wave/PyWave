@@ -12,7 +12,8 @@
 extern "C" {
 
 const float MAX_AMPLITUDE = 5.0f;
-const float BASE_DECAY = 0.0005f; 
+// Увеличиваем базовый распад для компенсации инерции
+const float BASE_DECAY = 0.001f; 
 
 inline float softsign(float x) { return x / (1.0f + std::abs(x)); }
 inline float clamp(float x) {
@@ -26,14 +27,14 @@ inline float fast_noise(int seed) {
     return ((float)(x & 0x7FFFFFFF) / 2147483648.0f) - 0.5f; 
 }
 
-// === EVOLUTION KERNEL (v37.5) ===
+// === EVOLUTION KERNEL (v37.6 - Fixed Entropy Gating) ===
 EXPORT void run_avx512_evolution(
     float* __restrict__ state,      
     float* __restrict__ buffer,     
     const float* __restrict__ rules,
     const float* __restrict__ anchors, 
     int B, int D, int steps,
-    float noise_level // Уровень энтропии по Гроку
+    float noise_level 
 ) {
     const float dt = 0.05f;
     const float inhib_speed = 0.4f;
@@ -56,19 +57,32 @@ EXPORT void run_avx512_evolution(
                 // 1. Stochastic Noise
                 float noise = fast_noise(b*D*steps + i*steps + t) * noise_level;
 
-                // 2. Input Gating (Homeostasis)
-                float gate = (b_fatigue > 0.8f) ? 0.0f : 1.0f;
+                // 2. Entropy Gating (Homeostasis)
+                // Gate теперь влияет и на память, предотвращая резонансные галлюцинации
+                float gate = (b_fatigue > 0.85f) ? 0.0f : 1.0f;
 
                 int l = (i - 1 + D) % D;
                 int rt = (i + 1) % D;
-                float input = (rules[0] * r_in[l] + rules[1] * r + rules[2] * r_in[rt]) * gate;
+                
+                // Lateral Input Processing
+                float input = (rules[0] * r_in[l] + rules[1] * r + rules[2] * r_in[rt]);
 
-                // Physics
+                // Physics (Reaction-Diffusion with Fatigue)
                 float db = (std::abs(r) * inhib_speed) - (b_fatigue * recovery_speed);
+                
+                // Green Channel (Memory/Anchor logic)
                 float dg = (anchors[i] - g_in[i]) * 0.1f + (r * 0.3f);
-                float dr = input + (g_in[i] * 0.6f) - (b_fatigue * 2.5f * r) + noise;
+                
+                // Red Channel (Activity)
+                // Term: (input + g_in[i] * 0.6f) * gate
+                // Гейтинг применяется к сумме входа и памяти
+                float excitation = (input + (g_in[i] * 0.6f)) * gate;
+                float inhibition = (b_fatigue * 2.5f * r);
+                
+                float dr = excitation - inhibition + noise;
 
-                r_out[i] = clamp(r + softsign(dr) * dt);
+                // Inertial clamping
+                r_out[i] = clamp((r + softsign(dr) * dt) * 0.98f);
                 g_out[i] = clamp(g_in[i] + dg * dt);
                 b_out[i] = clamp(std::max(0.0f, b_fatigue + db * dt));
             }
@@ -78,7 +92,7 @@ EXPORT void run_avx512_evolution(
     }
 }
 
-// === MEMORY UPDATE (Panic-Driven ADS) ===
+// === MEMORY UPDATE (Zen Decay v2) ===
 EXPORT void update_dynamic_memory(
     float* anchor_matrix, float* grads, int D, float lr, 
     float truth_signal, float panic_level
@@ -90,13 +104,18 @@ EXPORT void update_dynamic_memory(
 
         // ADS: Усиленный распад при панике
         float current_decay = BASE_DECAY * (1.0f + panic_level * 50.0f);
-        float decay_term = current_decay * w * w * ((w > 0) ? 1.0f : -1.0f);
+        
+        // Hybrid L1/L2 Decay: w * (0.5 + |w|)
+        // Гарантирует затухание даже малых весов (решает проблему исчезающего градиента распада)
+        float decay_force = current_decay * w * (0.5f + std::abs(w));
 
         // Reinforcement
         float reinforcement = (truth_signal > 0.15f && g * w > 0) ? (0.05f * std::abs(g) * truth_signal) : 0.0f;
 
-        anchor_matrix[d] = clamp(w - ((lr * g) + decay_term - (reinforcement * ((w > 0) ? 1 : -1))));
+        // Update with clamp
+        anchor_matrix[d] = clamp(w - ((lr * g) + decay_force - (reinforcement * ((w > 0) ? 1 : -1))));
     }
 }
 
-}
+} // End extern "C"
+// Лишняя скобка удалена
