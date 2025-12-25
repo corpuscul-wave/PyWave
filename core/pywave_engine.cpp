@@ -118,4 +118,4 @@ EXPORT void update_dynamic_memory(
 }
 
 } // End extern "C"
-// Лишняя скобка удалена
+
